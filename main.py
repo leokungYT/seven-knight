@@ -8,6 +8,11 @@ import concurrent.futures
 import threading
 import queue
 import sys
+import requests
+import ssl
+
+# Fix SSL certificate error for downloading EasyOCR models
+ssl._create_default_https_context = ssl._create_unverified_context
 
 try:
     import customtkinter as ctk
@@ -23,6 +28,22 @@ except ImportError:
 # Configuration
 adb_path = "adb"
 template_cache = {}
+DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1482703851227447316/8xqw1s_Phg6BsEQAEv1-NuVtvTBhJV0AGV8jHIBGbSdNYPLq-MROe-1YC728MZ0xN-uj"
+
+def send_discord_notification(message, image_path=None):
+    try:
+        data = {"content": message}
+        files = {}
+        if image_path and os.path.exists(image_path):
+            with open(image_path, "rb") as f:
+                response = requests.post(DISCORD_WEBHOOK, data=data, files={"file": f}, timeout=15)
+        else:
+            response = requests.post(DISCORD_WEBHOOK, json=data, timeout=15)
+        
+        if response.status_code not in [200, 204]:
+            print(f"[Discord] Error: {response.status_code}")
+    except Exception as e:
+        print(f"[Discord] Exception: {e}")
 
 def find_adb_executable():
     global adb_path
@@ -128,14 +149,54 @@ def connect_known_ports():
 
 def get_connected_devices():
     try:
-        result = subprocess.run([adb_path, "devices"], capture_output=True, text=True, timeout=10)
+        # result = subprocess.run([adb_path, "devices"], capture_output=True, text=True, timeout=10)
+        # lines = result.stdout.strip().split("\n")[1:]
+        # raw_devices = []
+        # for line in lines:
+        #     parts = line.strip().split()
+        #     if len(parts) >= 2 and parts[1] == "device":
+        #         raw_devices.append(parts[0])
+        # return raw_devices
+        
+        # Optimized version based on user request: Only take emulator-xxxx
+        kwargs = {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {}
+        result = subprocess.run([adb_path, "devices"], capture_output=True, text=True, timeout=10, **kwargs)
         lines = result.stdout.strip().split("\n")[1:]
-        raw_devices = []
+        devices = []
+        raw_list = []
         for line in lines:
             parts = line.strip().split()
             if len(parts) >= 2 and parts[1] == "device":
-                raw_devices.append(parts[0])
-        return raw_devices
+                raw_list.append(parts[0])
+        
+        # Deduplicate based on port logic
+        # emulator-5554 -> port 5555
+        # 127.0.0.1:5555 -> port 5555
+        port_map = {} # {port: original_id}
+        
+        for dev_id in raw_list:
+            port = None
+            if dev_id.startswith("emulator-"):
+                try:
+                    # Console port N means ADB port is N+1
+                    port = int(dev_id.split("-")[1]) + 1
+                except: continue
+            elif ":" in dev_id:
+                try:
+                    port = int(dev_id.split(":")[1])
+                except: continue
+            
+            if port:
+                # If we have multiple IDs for the same port, 
+                # keep 127.0.0.1 style if available, otherwise first found
+                if port not in port_map or ":" in dev_id:
+                    port_map[port] = dev_id
+            else:
+                # For non-numeric ports (like serial numbers), just keep them
+                if dev_id not in port_map.values():
+                    port_map[dev_id] = dev_id
+
+        return list(port_map.values())
     except:
         return []
 
@@ -155,8 +216,14 @@ class LiteBot(threading.Thread):
         if self.gui_app:
             self.gui_app.log("INFO", f"[{self.device_id}] Stop signal received.")
 
+    def sleep(self, seconds):
+        if seconds <= 0: return
+        start_time = time.time()
+        while self.running and (time.time() - start_time < seconds):
+            time.sleep(0.1)
+
     def capture_screen(self):
-        time.sleep(0.3)
+        self.sleep(0.3)
         try:
             kwargs = {}
             if os.name == 'nt':
@@ -164,7 +231,7 @@ class LiteBot(threading.Thread):
                 
             result = subprocess.run(
                 [self.adb_cmd, "-s", self.device_id, "exec-out", "screencap", "-p"],
-                capture_output=True, timeout=10, **kwargs
+                capture_output=True, timeout=12, **kwargs
             )
             
             if result.returncode == 0 and len(result.stdout) > 100:
@@ -217,11 +284,14 @@ class LiteBot(threading.Thread):
         return None
 
     def tap(self, x, y):
+        if not self.running: return
         import random
         jitter = random.uniform(0.05, 0.25)
-        time.sleep(0.1 + jitter)
+        self.sleep(0.1 + jitter)
+        if not self.running: return
         subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "input", "swipe", 
-                      str(x), str(y), str(x), str(y), "300"], capture_output=True)
+                      str(x), str(y), str(x), str(y), "300"], capture_output=True, 
+                      creationflags=(subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0))
 
     def wait_and_click_image(self, file_name, timeout=30, wait_disappear=False, max_clicks=1):
         img_path = f"img/{file_name}.png"
@@ -233,6 +303,24 @@ class LiteBot(threading.Thread):
         
         while self.running and (timeout is None or time.time() - start_time < timeout):
             self.capture_screen()
+            
+            # --- Auto-Click Global Interruptions ---
+            if file_name != "fixdata" and file_name != "icon": 
+                if self._find_in_screen("img/fixdata.png"):
+                    print(f"[{self.device_id}] ⚠️ Found fixdata.png! Clicking coordinate (632, 514).")
+                    self.tap(632, 514)
+                    self.sleep(1.5)
+                    self.capture_screen() # Refresh screen after clicking
+            
+            # Auto-Recovery: Check if app is still running while waiting
+            if not self.is_app_running():
+                print(f"[{self.device_id}] Game crashed while waiting for {file_name}! Restarting...")
+                self.open_app()
+                self.sleep(5)
+                # After restart, try to click icon if we are still far from our target
+                if file_name != "icon" and "out" not in file_name:
+                    self.wait_and_click_image("icon", timeout=10)
+            
             target = self.click(img_path)
             if target:
                 click_count += 1
@@ -248,16 +336,34 @@ class LiteBot(threading.Thread):
                 if not wait_disappear and click_count >= max_clicks:
                     return target
                     
-                time.sleep(1.5) # Wait a bit for screen to transition after click
+                self.sleep(1.5) # Wait a bit for screen to transition after click
             else:
                 if clicked_at_least_once:
                     print(f"[{self.device_id}] => {file_name} disappeared, moving next...")
                     return last_target
-                time.sleep(1)
+                self.sleep(1)
                 
         print(f"[{self.device_id}] Timeout - did not find {file_name}")
         return None
         
+    def is_app_running(self):
+        try:
+            # Check if package is running using pidof
+            kwargs = {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {}
+            result = subprocess.run(
+                [self.adb_cmd, "-s", self.device_id, "shell", "pidof", "com.netmarble.tskgb"],
+                capture_output=True, text=True, timeout=5, **kwargs
+            )
+            return result.stdout.strip() != ""
+        except:
+            return False
+
+    def open_app(self):
+        # Open app using monkey command (standard way to launch apps via package name)
+        print(f"[{self.device_id}] Launching app com.netmarble.tskgb...")
+        kwargs = {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {}
+        subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "monkey", "-p", "com.netmarble.tskgb", "-c", "android.intent.category.LAUNCHER", "1"], capture_output=True, **kwargs)
+
     def ocr_read_region(self, x, y, w, h):
         if not hasattr(self, '_screen_color') or self._screen_color is None:
             return []
@@ -288,19 +394,52 @@ class LiteBot(threading.Thread):
         
         while self.running:
             # Load config at the start of each loop so it can be updated live
-            target_name = "Kyle"
+            target_names = ["Kyle"]
             try:
                 with open("config.json", "r", encoding="utf-8") as f:
                     config = json.load(f)
-                    target_name = config.get("target_name", "Kyle")
+                    # Support both old "target_name" (string) and new "target_names" (list)
+                    if "target_names" in config:
+                        names = config["target_names"]
+                        if isinstance(names, list) and len(names) > 0:
+                            target_names = names
+                        elif isinstance(names, str):
+                            target_names = [names]
+                    elif "target_name" in config:
+                        target_names = [config["target_name"]]
             except Exception as e:
-                print(f"[{self.device_id}] Error loading config.json, using default '{target_name}': {e}")
+                print(f"[{self.device_id}] Error loading config.json, using default {target_names}: {e}")
                 
+            if not self.running: break
             print(f"\n=========================================")
             print(f"[{self.device_id}] STARTING NEW MAIN LOOP")
-            print(f"[{self.device_id}] Target Character for OCR: '{target_name}'")
-            print(f"=========================================\n")
-            
+            print(f"[{self.device_id}] Target Characters for OCR: {target_names}")
+            print(f"[{self.device_id}] Force-stopping app before starting new loop...")
+            subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "am", "force-stop", "com.netmarble.tskgb"], capture_output=True, creationflags=(subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0))
+            self.sleep(2)
+
+            # Auto-check if app is running (Wait up to 3s), if not start it (start packet)
+            is_running = False
+            for _ in range(3):
+                if not self.running: break
+                if self.is_app_running():
+                    is_running = True
+                    break
+                self.sleep(1)
+
+            if not self.running: break
+            if not is_running:
+                print(f"[{self.device_id}] Game not detected or crashed! Restarting packet...")
+                self.open_app()
+                # Wait another 3s and check again (total 6s)
+                self.sleep(3)
+                if not self.running: break
+                if not self.is_app_running():
+                    print(f"[{self.device_id}] App still not running after 6s. Trying to click 'icon' as fallback...")
+                    self.wait_and_click_image("icon", timeout=5)
+                else:
+                    self.sleep(2) # Finish initialization wait
+
             # --- COMMENTED OUT FOR TESTING ---
             steps = [
                 "icon",
@@ -312,13 +451,15 @@ class LiteBot(threading.Thread):
             ]
             
             for step in steps:
+                if not self.running: break
                 # wait_disappear only for gust2 and gust3
                 wait_disp = (step in ["gust2", "gust3"])
-                self.wait_and_click_image(step, timeout=None, wait_disappear=wait_disp)
-                time.sleep(1)
+                # Use a specific short timeout for icon so it doesn't hang if already in game
+                step_timeout = 5 if step == "icon" else None
+                self.wait_and_click_image(step, timeout=step_timeout, wait_disappear=wait_disp)
+                self.sleep(1)
             # ---------------------------------
                 
-            # Add skipstory with NO TIMEOUT (None means loop forever until found)
             skipstory_steps = [
                 "skipstory1", "skipstory2", "skipstory4", "skipstory5", 
                 "skipstory6", "skipstory7", "skipstory8","fixstory9",
@@ -332,94 +473,167 @@ class LiteBot(threading.Thread):
             ]
             
             for step in skipstory_steps:
+                if not self.running: break
                 # Wait for disappearance for fixstory9v2, skipstory10, skipstory11, skipstory21, skipstory22, skipstory23, skipstory27, skipstory28, skipstory31 and skipstory32
                 wait_disp = (step in ["fixstory9v2", "fixstory9v2.png", "skipstory10", "skipstory11", "skipstory21", "skipstory22", "skipstory23", "skipstory27", "skipstory28", "skipstory31", "skipstory32"])
                 clicks = 3 if step in ["skipstory29", "skipstory30"] else 1
+                
+                # Special timeout for fixstory9v2
                 step_timeout = 10 if step in ["fixstory9v2", "fixstory9v2.png"] else None
                 
-                target = self.wait_and_click_image(step, timeout=step_timeout, wait_disappear=wait_disp, max_clicks=clicks)
-                time.sleep(1)
+                if step == "skipstory16":
+                    # Special logic for skipstory16: If not found in 10s, tap once and check again
+                    print(f"[{self.device_id}] Waiting for skipstory16 (max 10s before retry)...")
+                    target = self.wait_and_click_image(step, timeout=10, wait_disappear=wait_disp, max_clicks=clicks)
+                    if not self.running: break
+                    if not target:
+                        print(f"[{self.device_id}] skipstory16 not found in 10s, tapping center and retrying skipstory16...")
+                        self.tap(500, 500) # Tap roughly center of screen
+                        self.sleep(1)
+                        if not self.running: break
+                        target = self.wait_and_click_image(step, timeout=None, wait_disappear=wait_disp, max_clicks=clicks)
+                elif step == "skipstory22":
+                    print(f"[{self.device_id}] Waiting for skipstory22 (max 10 clicks before fix)...")
+                    target = self.wait_and_click_image(step, timeout=30, wait_disappear=False)
+                    if target:
+                        click_count = 1
+                        disappeared = False
+                        
+                        while self.running and click_count < 10:
+                            self.capture_screen()
+                            if self.click(f"img/{step}.png"):
+                                click_count += 1
+                                print(f"[{self.device_id}] => Clicked {step} ({click_count}/10)")
+                                self.sleep(1.5)
+                            else:
+                                print(f"[{self.device_id}] => {step} disappeared, moving next...")
+                                disappeared = True
+                                break
+                        
+                        if not disappeared and self.running:
+                            print(f"[{self.device_id}] {step} stuck after 10 clicks! Trying skipstory22fix...")
+                            self.wait_and_click_image("skipstory22fix", timeout=10)
+                            self.sleep(1)
+                            print(f"[{self.device_id}] Retrying skipstory22 again...")
+                            target = self.wait_and_click_image(step, timeout=None, wait_disappear=True)
+                else:
+                    target = self.wait_and_click_image(step, timeout=step_timeout, wait_disappear=wait_disp, max_clicks=clicks)
+                
+                self.sleep(1)
                 
                 # Special case for skipstory2: Wait 15 secs and tap the same position again instead of looking for skipstory3
                 if step == "skipstory2" and target:
                     print(f"[{self.device_id}] Delay 15s and tap same position for skipping part 3 ...")
-                    time.sleep(15)
+                    self.sleep(15)
                     self.tap(target[0], target[1])
-                    time.sleep(1)
+                    self.sleep(1)
 
             # Clear app (break logic)
+            if not self.running: break
             print(f"[{self.device_id}] Closing app com.netmarble.tskgb...")
-            subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "am", "force-stop", "com.netmarble.tskgb"], capture_output=True)
+            subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "am", "force-stop", "com.netmarble.tskgb"], capture_output=True, creationflags=(subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0))
             print(f"[{self.device_id}] App closed successfully.")
             # Breaking out of this "section" to proceed below
             
             # Additional step sequences
             stepp_list = ["icon", "stepp1", "stepp2", "stepp3", "stepp4", "stepp5", "stepp6", "stepp7", "stepp8"]
             for step in stepp_list:
-                self.wait_and_click_image(step, timeout=None)
-                time.sleep(1)
+                if not self.running: break
+                step_timeout = 5 if step == "icon" else None
+                self.wait_and_click_image(step, timeout=step_timeout)
+                self.sleep(1)
                 
             gacha_list = ["gacha1", "gacha2", "gacha3"]
             for step in gacha_list:
+                if not self.running: break
                 self.wait_and_click_image(step, timeout=None)
-                time.sleep(1)
+                self.sleep(1)
                 
             # Tap 946, 668 13 times
+            if not self.running: break
             print(f"[{self.device_id}] Tapping (946, 668) 13 times...")
             for i in range(13):
+                if not self.running: break
                 self.tap(946, 668)
-                time.sleep(0.5)
+                self.sleep(0.5)
                 
+            if not self.running: break
             self.wait_and_click_image("gacha4", timeout=None)
-            time.sleep(1)
+            self.sleep(1)
             
+            if not self.running: break
             self.wait_and_click_image("selectgacha", timeout=None)
-            time.sleep(1)
+            self.sleep(1)
             
+            if not self.running: break
             self.wait_and_click_image("selectgacha1", timeout=None)
-            time.sleep(1)
+            self.sleep(1)
                 
+            if not self.running: break
             self.wait_and_click_image("gacha3", timeout=None)
-            time.sleep(1)
+            self.sleep(1)
 
+            if not self.running: break
             print(f"[{self.device_id}] Tapping (946, 668) 13 times for second round...")
             for i in range(13):
+                if not self.running: break
                 self.tap(946, 668)
-                time.sleep(0.5)
+                self.sleep(0.5)
 
             # Scan name via OCR BEFORE gacha4
-            print(f"[{self.device_id}] Checking name via OCR for '{target_name}'...")
+            print(f"[{self.device_id}] Checking name via OCR for targets: {target_names}...")
             self.capture_screen() # Ensure fresh screen
             # Region(70, 74, 1107, 543) -> Wait, 1107x543 is huge,
             # (x, y, w, h)
             text_data = self.ocr_read_region(70, 74, 1107, 543)
             found_target = False
+            matched_name = None
             for text, conf in text_data:
                 print(f"[{self.device_id}] OCR Read: '{text}' (conf: {conf:.2f})")
-                if target_name.lower() in text.lower():
-                    found_target = True
+                for tname in target_names:
+                    if tname.lower() in text.lower():
+                        found_target = True
+                        matched_name = tname
+                        break
+                if found_target:
                     break
                     
             if found_target:
-                print(f"[{self.device_id}] => SUCCESS! Found target character '{target_name}'.")
+                print(f"[{self.device_id}] => SUCCESS! Found target character '{matched_name}'.")
+                
+                # Notification to Discord
+                msg = f"🎯 **SUCCESS! Found target!**\nDevice: `{self.device_id}`\nMatched: **{matched_name}**\nAll targets: {target_names}"
+                img_path = f"found_{self.device_id}.png"
+                if hasattr(self, '_screen_color') and self._screen_color is not None:
+                    cv2.imwrite(img_path, self._screen_color)
+                    send_discord_notification(msg, img_path)
+                else:
+                    send_discord_notification(msg)
+                
                 print(f"[{self.device_id}] Stopping bot for this window. Please check the emulator manually.")
                 if self.gui_app:
-                    self.gui_app.notify_found(self.device_id, target_name)
+                    self.gui_app.notify_found(self.device_id, matched_name)
                 return # Stop this specific instance by returning out of the function/thread
 
-            print(f"[{self.device_id}] Target '{target_name}' not found. Continuing process...")
+            print(f"[{self.device_id}] None of targets {target_names} found. Continuing process...")
 
             stepout_list = ["gacha4", "out1", "out2", "out3", "out4", "out5", "out6"]
             
             # Do out sequences
             for step in stepout_list:
+                if not self.running: break
                 self.wait_and_click_image(step, timeout=None)
-                time.sleep(1)
+                if step == "out6":
+                    print(f"[{self.device_id}] Clicked out6.png, waiting 10s before clearing app...")
+                    self.sleep(10)
+                else:
+                    self.sleep(1)
                 
             # close app via adb
+            if not self.running: break
             print(f"[{self.device_id}] Restarting loop sequence. Closing app...\n")
             subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "am", "force-stop", "com.netmarble.tskgb"], capture_output=True)
-            time.sleep(2)
+            self.sleep(2)
 
         print(f"[{self.device_id}] Bot thread stopped gracefully.")
 
@@ -486,10 +700,11 @@ class MainGUI(ctk.CTk):
     def __init__(self, devices):
         super().__init__()
         self.title("Seven Knights Bot Control")
-        self.geometry("600x450")
+        self.geometry("1000x850") # Increased size for better log visibility
         self.devices = devices
         self.bot_threads = {}
         self.device_monitors = {}
+        self.log_widgets = {}
         
         self.setup_ui()
         
@@ -507,7 +722,8 @@ class MainGUI(ctk.CTk):
         toolbar.pack(fill="x")
         toolbar.pack_propagate(False)
         
-        ctk.CTkLabel(toolbar, text=f"   ● ONLINE ({len(self.devices)})", font=ctk.CTkFont(size=12, weight="bold"), text_color="#4caf50").pack(side="left", padx=10)
+        self.lbl_online_count = ctk.CTkLabel(toolbar, text=f"   ● ONLINE ({len(self.devices)})", font=ctk.CTkFont(size=12, weight="bold"), text_color="#4caf50")
+        self.lbl_online_count.pack(side="left", padx=10)
         ctk.CTkButton(toolbar, text="▶ START ALL", width=80, height=24, fg_color="#4caf50", hover_color="#388e3c", command=self.start_all_bots).pack(side="left", padx=5)
         ctk.CTkButton(toolbar, text="⏹ STOP ALL", width=80, height=24, fg_color="#e53935", hover_color="#c62828", command=self.stop_all_bots).pack(side="left", padx=5)
         
@@ -527,20 +743,85 @@ class MainGUI(ctk.CTk):
         log_frame = ctk.CTkFrame(self, fg_color="#1e1e1e", corner_radius=6)
         log_frame.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         
-        self.log_text = ctk.CTkTextbox(log_frame, font=ctk.CTkFont(family="Consolas", size=10), text_color="#aaaaaa", fg_color="#1e1e1e")
-        self.log_text.pack(fill="both", expand=True, padx=2, pady=2)
-        self.log_text.configure(state="disabled")
+        # Use a Tabview for separate logs
+        self.log_tabs = ctk.CTkTabview(log_frame, fg_color="#1e1e1e", segmented_button_fg_color="#333333", segmented_button_selected_color="#4caf50")
+        self.log_tabs.pack(fill="both", expand=True, padx=2, pady=2)
+        
+        # Create Global tab
+        self.add_log_tab("Global")
+        
+        # Create tabs for each device
+        for dev in self.devices:
+            self.add_log_tab(dev)
+
+        # Bottom Bar
+        bottom_bar = ctk.CTkFrame(self, height=32, fg_color="#333333", corner_radius=0)
+        bottom_bar.pack(fill="x", side="bottom")
+        ctk.CTkButton(bottom_bar, text="🔌 Connect ADB", width=100, height=24, font=ctk.CTkFont(size=11), fg_color="#4caf50", hover_color="#388e3c", command=self.connect_missing_devices).pack(side="left", padx=10, pady=4)
+        ctk.CTkLabel(bottom_bar, text="v1.1.0", font=ctk.CTkFont(size=10), text_color="#888888").pack(side="right", padx=10)
+
+    def add_log_tab(self, name):
+        # Clean name for tab ID (remove special chars if any, but device IDs should be okay)
+        tab = self.log_tabs.add(name)
+        log_text = ctk.CTkTextbox(tab, font=ctk.CTkFont(family="Consolas", size=13), text_color="#aaaaaa", fg_color="#1e1e1e")
+        log_text.pack(fill="both", expand=True, padx=2, pady=2)
+        log_text.configure(state="disabled")
+        self.log_widgets[name] = log_text
+
+    def connect_missing_devices(self):
+        self.log("INFO", "Scanning for missing emulators...")
+        connect_known_ports()
+        
+        current_devices = get_connected_devices()
+        new_count = 0
+        for dev in current_devices:
+            if dev not in self.devices:
+                new_count += 1
+                self.devices.append(dev)
+                
+                # Add to UI
+                m = DeviceMonitorWidget(self.dev_scroll, dev, len(self.devices), self)
+                m.pack(fill="x", pady=1)
+                self.device_monitors[dev] = m
+                
+                # Add log tab
+                self.add_log_tab(dev)
+                
+                self.log("INFO", f"Connected new device: {dev}")
+        
+        if new_count > 0:
+            self.lbl_online_count.configure(text=f"   ● ONLINE ({len(self.devices)})")
+            self.log("INFO", f"Found {new_count} new device(s).")
+        else:
+            self.log("INFO", "No new devices found.")
 
     def log(self, level, message): 
         from datetime import datetime
         ts = datetime.now().strftime("%H:%M:%S")
-        self.log_text.configure(state="normal")
-        self.log_text.insert("end", f"[{ts}] {message}\n")
-        line_count = int(self.log_text.index('end-1c').split('.')[0])
+        
+        # Determine which tab to use based on message prefix like [emulator-5554]
+        target_tab = "Global"
+        clean_msg = message
+        
+        if message.strip().startswith("["):
+            end_idx = message.find("]")
+            if end_idx != -1:
+                dev_id = message[1:end_idx]
+                if dev_id in self.log_widgets:
+                    target_tab = dev_id
+                    # We can keep the prefix or remove it. Let's keep it for context.
+        
+        target_widget = self.log_widgets.get(target_tab, self.log_widgets["Global"])
+        
+        target_widget.configure(state="normal")
+        target_widget.insert("end", f"[{ts}] {clean_msg}\n")
+        
+        line_count = int(target_widget.index('end-1c').split('.')[0])
         if line_count > 1000:
-            self.log_text.delete('1.0', f'{line_count - 500}.0')
-        self.log_text.see("end")
-        self.log_text.configure(state="disabled")
+            target_widget.delete('1.0', f'{line_count - 500}.0')
+        
+        target_widget.see("end")
+        target_widget.configure(state="disabled")
 
     def process_log_queue(self):
         try:
@@ -576,7 +857,7 @@ class MainGUI(ctk.CTk):
     def start_all_bots(self):
         for dev in self.devices:
             self.start_bot(dev)
-            time.sleep(1) # stagger
+            time.sleep(2) # Increased stagger to 2s for stability
 
     def stop_all_bots(self):
         for dev in self.devices:
@@ -598,7 +879,7 @@ def main():
         print("[ERR] adb not found")
         return
         
-    connect_known_ports()
+    connect_known_ports() # Enabled to automatically connect to emulators
     devices = get_connected_devices()
     
     if not devices:
